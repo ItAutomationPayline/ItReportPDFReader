@@ -42,7 +42,8 @@ namespace ITReport_PDF_Reader
             // Write to Excel
             WriteToExcel(records);
 
-            Console.WriteLine("Processing completed. Excel file generated in Output folder.");
+            Console.WriteLine("Processing completed.");
+            Console.ReadLine();
         }
 
         // 🔹 Extract PAN + Amounts from PDF
@@ -62,7 +63,6 @@ namespace ITReport_PDF_Reader
                     {
                         if (line.Contains("Spot tax for the current processed month"))
                         {
-                            // --- Extract Tax & Base amounts ---
                             var match = Regex.Match(line, @"Rs\.?\s?([\d,]+).*?Rs[:.]?\s?([\d,]+)");
                             if (match.Success)
                             {
@@ -76,66 +76,26 @@ namespace ITReport_PDF_Reader
                                 string panSearchText = pageText + (i > 0 ? pages[i - 1].Text : "");
                                 var panMatch = Regex.Match(panSearchText, @"PAN\s*:\s*([A-Z]{3}P[A-Z][0-9]{4}[A-Z])");
                                 if (panMatch.Success)
-                                {
                                     pan = panMatch.Groups[1].Value;
-                                }
-                                var searchText = new StringBuilder();
-                                if (i > 0) searchText.AppendLine(pages[i - 1].Text ?? string.Empty);
-                                searchText.AppendLine(pageText);
-                                if (i < pages.Count - 1) searchText.AppendLine(pages[i + 1].Text ?? string.Empty);
-                                string combined = searchText.ToString();
+
                                 // --- Employee ID Extraction ---
-                                // Look for digits (6–10 long, no commas) near "Below 60 years"
-                                int idxYears = combined.IndexOf("years", StringComparison.OrdinalIgnoreCase);
-                                int idxPan = -1;
-                                if (idxYears >= 0)
+                                // FIX: Search current page FIRST before expanding to adjacent pages.
+                                // This prevents picking up the employee ID from a previous page when
+                                // "years" and "PAN" both exist earlier in the combined text.
+                                employeeId = ExtractEmployeeId(pageText);
+
+                                if (employeeId == "NOT FOUND")
                                 {
-                                    // search for PAN after idxYears; if not found, try any PAN
-                                    idxPan = combined.IndexOf("PAN", idxYears, StringComparison.OrdinalIgnoreCase);
+                                    // Only expand search to adjacent pages if not found on current page
+                                    var searchText = new StringBuilder();
+                                    if (i > 0) searchText.AppendLine(pages[i - 1].Text ?? string.Empty);
+                                    searchText.AppendLine(pageText);
+                                    if (i < pages.Count - 1) searchText.AppendLine(pages[i + 1].Text ?? string.Empty);
+                                    employeeId = ExtractEmployeeId(searchText.ToString());
                                 }
-                                if (idxYears >= 0 && idxPan > idxYears)
-                                {
-                                    int start = idxYears + "years".Length;
-                                    int len = idxPan - start;
-                                    if (len > 0)
-                                    {
-                                        string between = combined.Substring(start, len);
-                                         //extract first continuous digits sequence (no commas) from the between-substring
-                                        var digitsMatch = Regex.Match(between, @"\d{4,12}");
-                                        if (digitsMatch.Success)
-                                        {
-                                            employeeId = digitsMatch.Value;
-                                        }
-                                    }
-                                }
-                                else
-                                {
-                                    // Fallback: look for a digit-only line immediately after phrases like "Below 60 years"
-                                    var fallback = Regex.Match(combined, @"Below\s*\d+\s*years[\s\S]{0,60}?(\b\d{4,12}\b)", RegexOptions.IgnoreCase);
-                                    if (fallback.Success)
-                                    {
-                                        employeeId = fallback.Groups[1].Value;
-                                    }
-                                    else
-                                    {
-                                        // Another fallback: look for a standalone 6-10 digit number near where "PAN" appears
-                                        // (in case 'years' isn't present exactly)
-                                        int panIndexAny = combined.IndexOf("PAN", StringComparison.OrdinalIgnoreCase);
-                                        if (panIndexAny > 0)
-                                        {
-                                            // take up to 100 chars before PAN and search for digits
-                                            int startIdx = Math.Max(0, panIndexAny - 100);
-                                            string beforePan = combined.Substring(startIdx, panIndexAny - startIdx);
-                                            var dm = Regex.Match(beforePan, @"(\d{6,10})");
-                                            if (dm.Success) employeeId = dm.Groups[1].Value;
-                                        }
-                                    }
-                                }
-                                // --- Add result if values are valid ---
-                                if (Convert.ToDouble(taxAmount.Replace(",", "")) >  Convert.ToDouble(baseAmount.Replace(",", ""))*0.4)
-                                {
+
+                                if (Convert.ToDouble(taxAmount.Replace(",", "")) > Convert.ToDouble(baseAmount.Replace(",", "")) * 0.4)
                                     results.Add((pan, employeeId, taxAmount, baseAmount));
-                                }
                             }
                         }
                     }
@@ -143,6 +103,48 @@ namespace ITReport_PDF_Reader
             }
 
             return results;
+        }
+
+        // Extracted helper — runs the same ID logic on whichever text block is passed in
+        private static string ExtractEmployeeId(string combined)
+        {
+            int idxYears = combined.IndexOf("years", StringComparison.OrdinalIgnoreCase);
+            int idxPan = idxYears >= 0
+                ? combined.IndexOf("PAN", idxYears, StringComparison.OrdinalIgnoreCase)
+                : -1;
+
+            if (idxYears >= 0 && idxPan > idxYears)
+            {
+                int start = idxYears + "years".Length;
+                int len = idxPan - start;
+                if (len > 0)
+                {
+                    string between = combined.Substring(start, len);
+                    var digitsMatch = Regex.Match(between, @"\d{4,12}");
+                    if (digitsMatch.Success)
+                        return digitsMatch.Value;
+                }
+            }
+            else
+            {
+                // Fallback 1: digits within 60 chars after "Below N years"
+                var fallback = Regex.Match(combined, @"Below\s*\d+\s*years[\s\S]{0,60}?(\b\d{4,12}\b)", RegexOptions.IgnoreCase);
+                if (fallback.Success)
+                    return fallback.Groups[1].Value;
+
+                // Fallback 2: standalone 6-10 digit number in the 100 chars before "PAN"
+                int panIndexAny = combined.IndexOf("PAN", StringComparison.OrdinalIgnoreCase);
+                if (panIndexAny > 0)
+                {
+                    int startIdx = Math.Max(0, panIndexAny - 100);
+                    string beforePan = combined.Substring(startIdx, panIndexAny - startIdx);
+                    var dm = Regex.Match(beforePan, @"(\d{6,10})");
+                    if (dm.Success)
+                        return dm.Groups[1].Value;
+                }
+            }
+
+            return "NOT FOUND";
         }
         // 🔹 Write extracted data to Excel
         public static void WriteToExcel(List<(string Pan,string empid, string TaxAmount, string BaseAmount)> records)
@@ -178,12 +180,14 @@ namespace ITReport_PDF_Reader
                         row++;
                     }
 
+                    Console.WriteLine("output file generated successfully.");
                     //ws.Cells[ws.Dimension.Address].AutoFitColumns();
                     package.SaveAs(new FileInfo(excelFile));
                 }
             }
-            catch (Exception)
+            catch (Exception e)
             {
+                Console.WriteLine("An error occured:"+e);
                 throw;
             }
         }
